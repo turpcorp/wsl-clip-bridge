@@ -11,6 +11,8 @@
 #   wsl-clip-bridge --stop       kill the listener via taskkill.exe
 #   wsl-clip-bridge --status     check whether the listener is running
 #   wsl-clip-bridge --doctor     check process counts; restart if unhealthy
+#   wsl-clip-bridge --watch      run --doctor's check every 30s (one instance)
+#   wsl-clip-bridge --ensure     start the watchdog detached if not running
 #   wsl-clip-bridge --help
 
 set -euo pipefail
@@ -18,6 +20,58 @@ set -euo pipefail
 LINUX_OUT="${WSL_CLIP_OUT:-$HOME/.cache/wsl-clip-bridge}"
 LISTENER_EXE="${WSL_CLIP_BRIDGE_EXE:-$HOME/.local/share/wsl-clip-bridge/clip-listener.exe}"
 LOG_FILE="${WSL_CLIP_LOG:-$HOME/.cache/wsl-clip-bridge/bridge.log}"
+WATCH_LOCK="$LINUX_OUT/watch.lock"
+WATCH_INTERVAL="${WSL_CLIP_WATCH_INTERVAL:-30}"
+
+# Shells spawned at Claude Desktop launch lack XDG_RUNTIME_DIR, so wl-copy
+# cannot reach the Wayland socket. Supply WSLg's defaults.
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}"
+
+# A healthy bridge has exactly one clip-listener.exe running (Win32 mutex
+# enforces this) AND the most recent "starting" in the log has a matching
+# "clip-listener started" after it. The second check catches the
+# orphaned-wrapper case: a bash wrapper started but its Go child died on
+# mutex collision, so no "clip-listener started" ever followed.
+check_health() {
+    local procs lc last_start last_ready
+    procs="$(tasklist.exe /FI "IMAGENAME eq clip-listener.exe" 2>/dev/null || true)"
+    # grep -c always prints, but exits 1 with no matches — swallow it.
+    lc="$(grep -c -F 'clip-listener.exe' <<<"$procs" || true)"
+    : "${lc:=0}"
+    printf '  clip-listener.exe: %s (expect 1)\n' "$lc"
+    last_start="$(grep -n 'starting (' "$LOG_FILE" 2>/dev/null | tail -1 | cut -d: -f1 || true)"
+    last_ready="$(grep -n 'clip-listener started' "$LOG_FILE" 2>/dev/null | tail -1 | cut -d: -f1 || true)"
+    : "${last_start:=0}" "${last_ready:=0}"
+    if (( last_start > last_ready )); then
+        printf "  log: last 'starting' (line %s) has no 'clip-listener started' after it\n" "$last_start"
+        return 1
+    fi
+    printf "  log: last 'starting' paired with 'clip-listener started'\n"
+    # Without a wrapper, the listener still saves PNGs but nothing wl-copies them.
+    if ! pgrep -f "bash $0\$" >/dev/null 2>&1; then
+        printf '  wrapper: none running\n'
+        return 1
+    fi
+    [[ "$lc" -eq 1 ]]
+}
+
+# Kill the listener and every Linux-side bridge process, then spawn a fresh
+# detached bridge. The listener can vanish on the Windows side while its
+# /init proxy and the bash wrappers stay alive and never read EOF, so they
+# are killed explicitly rather than left to exit on their own.
+repair() {
+    taskkill.exe /F /IM clip-listener.exe >/dev/null 2>&1 || true
+    pkill -f "^/init $LISTENER_EXE" 2>/dev/null || true
+    local pid
+    for pid in $(pgrep -f "bash $0\$" 2>/dev/null || true); do
+        [[ "$pid" != "$$" ]] && kill "$pid" 2>/dev/null || true
+    done
+    sleep 0.5
+    # setsid, not nohup: a plain background child is killed when the
+    # wsl.exe session that ran --doctor exits (e.g. a Windows launcher).
+    setsid -f "$0" >/dev/null 2>&1 </dev/null
+}
 
 case "${1:-}" in
     --stop|stop)
@@ -44,45 +98,17 @@ case "${1:-}" in
         exit 0
         ;;
     --doctor|doctor)
-        # A healthy bridge has exactly one clip-listener.exe running (Win32
-        # mutex enforces this) AND the most recent "starting" in the log has
-        # a matching "clip-listener started" after it. The second check
-        # catches the orphaned-wrapper case: a bash wrapper started but its
-        # Go child died on mutex collision, so no "clip-listener started"
-        # ever followed. On unhealthy state, kill the listener (which makes
-        # any orphaned wrapper read EOF and exit) and spawn a fresh detached
-        # bridge.
         if ! command -v tasklist.exe >/dev/null 2>&1; then
             echo "tasklist.exe not found — is WSL interop enabled?" >&2
             exit 1
         fi
-        check_health() {
-            local procs lc last_start last_ready
-            procs="$(tasklist.exe /FI "IMAGENAME eq clip-listener.exe" 2>/dev/null || true)"
-            # grep -c always prints, but exits 1 with no matches — swallow it.
-            lc="$(grep -c -F 'clip-listener.exe' <<<"$procs" || true)"
-            : "${lc:=0}"
-            printf '  clip-listener.exe: %s (expect 1)\n' "$lc"
-            last_start="$(grep -n 'starting (' "$LOG_FILE" 2>/dev/null | tail -1 | cut -d: -f1 || true)"
-            last_ready="$(grep -n 'clip-listener started' "$LOG_FILE" 2>/dev/null | tail -1 | cut -d: -f1 || true)"
-            : "${last_start:=0}" "${last_ready:=0}"
-            if (( last_start > last_ready )); then
-                printf "  log: last 'starting' (line %s) has no 'clip-listener started' after it\n" "$last_start"
-                return 1
-            fi
-            printf "  log: last 'starting' paired with 'clip-listener started'\n"
-            [[ "$lc" -eq 1 ]]
-        }
         echo "checking..."
         if check_health; then
             echo "healthy"
             exit 0
         fi
         echo "unhealthy — repairing"
-        taskkill.exe /F /IM clip-listener.exe >/dev/null 2>&1 || true
-        sleep 0.5  # let any orphaned wrapper read EOF and exit
-        nohup "$0" >/dev/null 2>&1 &
-        disown
+        repair
         # Poll for up to 15s — Go's GDI+ init can take a few seconds on
         # cold start before it emits "clip-listener started".
         echo "rechecking..."
@@ -93,6 +119,37 @@ case "${1:-}" in
         echo "still unhealthy after repair — check $LOG_FILE" >&2
         check_health || true
         exit 1
+        ;;
+    --watch|watch)
+        # Single instance: a second watchdog exits at once.
+        mkdir -p "$LINUX_OUT"
+        exec 9>"$WATCH_LOCK"
+        flock -n 9 || exit 0
+        echo "[$(date -Is)] watchdog started (pid $$, every ${WATCH_INTERVAL}s)" >> "$LOG_FILE"
+        # Repair needs two unhealthy checks in a row, so a bridge that is
+        # mid-start (Go's GDI+ init can take seconds) is not killed.
+        strikes=0
+        while :; do
+            if check_health >/dev/null 2>&1; then
+                strikes=0
+            elif (( ++strikes >= 2 )); then
+                echo "[$(date -Is)] watchdog: unhealthy — repairing" >> "$LOG_FILE"
+                repair 9>&-
+                strikes=0
+            fi
+            sleep "$WATCH_INTERVAL"
+        done
+        ;;
+    --ensure|ensure)
+        # Cheap: flock is checked locally, no Windows interop call.
+        mkdir -p "$LINUX_OUT"
+        if flock -n "$WATCH_LOCK" true 2>/dev/null; then
+            setsid -f "$0" --watch >/dev/null 2>&1 </dev/null
+            echo "watchdog started"
+        else
+            echo "watchdog already running"
+        fi
+        exit 0
         ;;
     --help|-h|help)
         sed -n '2,/^set -e/p' "$0" | sed -e 's/^# \{0,1\}//' -e '$d'
@@ -120,21 +177,84 @@ log() { echo "[$(date -Is)] $*" >> "$LOG_FILE"; }
 
 log "starting (linux-out=$LINUX_OUT win-out=$WIN_OUT)"
 
-# reassert: sleep briefly after the initial wl-copy, then re-claim the
-# Wayland selection if WSLg's Windows→Wayland sync has clobbered our
-# image/png back to image/bmp. One single attempt — empirically all that
-# was ever needed; the additional polling we used to do never fired.
-reassert_once() {
-    local path="$1"
-    sleep 0.5
-    [[ -f "$path" ]] || return
-    local types
-    types="$(wl-paste -l 2>/dev/null)"
-    if grep -qx 'image/png' <<<"$types"; then
+# reassert: after the initial wl-copy, watch the Wayland selection and
+# re-claim it if WSLg's Windows→Wayland sync clobbers our image/png back to
+# image/bmp. The round-trip usually lands within 0.5s but has been logged
+# as late as 3s, so a single check at 0.5s missed about a quarter of them
+# and left the clipboard as image/bmp, which Claude cannot paste.
+# Only image/bmp-without-png is re-claimed, so a user copying text in the
+# window is left alone. A newer clip takes over via CURRENT_FILE.
+CURRENT_FILE="$LINUX_OUT/current"
+REASSERT_WINDOW_TICKS=16   # 16 x 0.25s = 4s
+
+# "WxH" from a PNG (IHDR, big-endian) or BMP (info header, little-endian;
+# height may be negative for top-down rows) read on stdin.
+png_dims() { od -An -tu1 -j16 -N8 | awk '{printf "%dx%d", $1*16777216+$2*65536+$3*256+$4, $5*16777216+$6*65536+$7*256+$8}'; }
+bmp_dims() {
+    od -An -tu1 -j18 -N8 | awk '{
+        w = $1 + $2*256 + $3*65536 + $4*16777216
+        h = $5 + $6*256 + $7*65536 + $8*16777216
+        if (h >= 2147483648) h = 4294967296 - h
+        printf "%dx%d", w, h }'
+}
+
+# Copying a new image while the previous one is still syncing puts the NEW
+# image on Wayland as image/bmp before the listener emits it. Re-asserting
+# then would paste the old image over the new one, so only re-claim when
+# the bmp has our image's dimensions (i.e. it is WSLg echoing our own copy).
+reassert_watch() {
+    local path="$1" types i probe="${1%.png}.probe.bmp"
+    for (( i = 0; i < REASSERT_WINDOW_TICKS; i++ )); do
+        sleep 0.25
+        [[ -f "$path" ]] || return
+        [[ "$(cat "$CURRENT_FILE" 2>/dev/null)" == "$path" ]] || return
+        types="$(wl-paste -l 2>/dev/null)"
+        grep -qx 'image/png' <<<"$types" && continue
+        grep -qx 'image/bmp' <<<"$types" || return
+        # Drain the whole bmp before parsing. Piping wl-paste into a reader
+        # that stops after the header closes the pipe while WSLg is still
+        # writing, and weston dies of SIGPIPE, taking every window with it.
+        wl-paste --type image/bmp > "$probe" 2>/dev/null || return
+        [[ "$(bmp_dims < "$probe")" == "$(png_dims < "$path")" ]] || return
+        wl-copy --type image/png < "$path" 2>/dev/null
+        log "re-asserted $(basename "$path") after $(( (i + 1) * 25 ))0ms (was: $(tr '\n' ',' <<<"$types"))"
+    done
+}
+
+# reown_text: Claude pastes nothing from WSLg's offer of text copied with an
+# empty EnterpriseDataProtectionId marker (Notepad, Explorer), but pastes the
+# same text once a Linux client owns it. Wait for WSLg to sync this copy
+# (UTF-16 length within the listener's block size, which may be padded), then
+# re-copy it. Giving up is safe; re-copying a stale selection would overwrite
+# the user's new copy on Windows, so only a length that fits the listener's
+# block is taken. WSLg usually syncs before the listener's line arrives, so
+# the first check normally succeeds; the size is exact in practice, padding
+# of a few units is tolerated.
+REOWN_TICKS=20   # 20 x 0.1s = 2s
+linux_text() {
+    # Command substitution drains the whole transfer (see reassert_watch);
+    # the trailing x keeps a final newline that $(...) would strip.
+    local t
+    t="$(wl-paste -n -t 'text/plain;charset=utf-8' 2>/dev/null; printf x)"
+    printf '%s' "${t%x}"
+}
+utf16_units() { echo $(( $(iconv -f utf-8 -t utf-16le 2>/dev/null | wc -c) / 2 )); }
+reown_text() {
+    local units="$1" i text n
+    for (( i = 0; i < REOWN_TICKS; i++ )); do
+        (( i == 0 )) || sleep 0.1
+        text="$(linux_text; printf x)"
+        text="${text%x}"
+        n="$(printf '%s' "$text" | utf16_units)"
+        (( n <= units && n + 4 >= units )) || continue
+        if printf '%s' "$text" | wl-copy --type 'text/plain;charset=utf-8' 2>>"$LOG_FILE"; then
+            log "re-owned marked text after $(( i * 100 ))ms ($n of $units UTF-16 units)"
+        else
+            log "wl-copy failed re-owning marked text"
+        fi
         return
-    fi
-    wl-copy --type image/png < "$path" 2>/dev/null
-    log "re-asserted $(basename "$path") (was: $(tr '\n' ',' <<<"$types"))"
+    done
+    log "skip re-own: Linux text never matched the copy (last $n, expected <= $units)"
 }
 
 # Stdin is closed so the listener does not contend for the tty.
@@ -148,13 +268,17 @@ while IFS= read -r line; do
                 size="$(stat -c %s "$path" 2>/dev/null || wc -c < "$path")"
                 if wl-copy --type image/png < "$path" 2>>"$LOG_FILE"; then
                     log "copied $path to wayland clipboard ($size bytes)"
-                    reassert_once "$path" &
+                    printf '%s' "$path" > "$CURRENT_FILE"
+                    reassert_watch "$path" &
                 else
                     log "wl-copy failed for $path"
                 fi
             else
                 log "missing file: $path"
             fi
+            ;;
+        "REOWN-TEXT "*)
+            reown_text "${line#REOWN-TEXT }" &
             ;;
         *)
             log "stdout: $line"

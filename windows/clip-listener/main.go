@@ -5,6 +5,16 @@
 // PNG via GDI+ (so Windows handles BI_BITFIELDS BMPs natively) and emits
 // "IMAGE <linux-path>" on stdout for the WSL-side consumer.
 //
+// Text is never read. For a copy that advertises the EnterpriseDataProtectionId
+// format with no data behind it (Notepad and Explorer do this), Claude's Wayland
+// paste comes out empty, so the listener emits "REOWN-TEXT <utf16-units>" and
+// the WSL side re-copies the text that WSLg already synced. The unit count comes
+// from the size of the CF_UNICODETEXT block, not its contents, and lets the WSL
+// side confirm it is re-copying this copy and not a stale one. Copies flagged by
+// password managers (ExcludeClipboardContentFromMonitorProcessing, Clipboard
+// Viewer Ignore) and copies whose marker carries a real enterprise label are
+// left alone.
+//
 // Single-instance: a named mutex Local\WSLClipBridgeListener — a second
 // invocation exits cleanly. Stdin is expected to be redirected to NUL by
 // the caller so the process does not steal keystrokes from the parent tty.
@@ -28,6 +38,7 @@ const (
 	wmDestroy          = 0x0002
 	wmClipboardUpdate  = 0x031D
 	cfBitmap           = 2
+	cfUnicodeText      = 13
 	gdiplusOk          = 0
 	errorAlreadyExists = 183
 
@@ -105,10 +116,12 @@ var (
 	pCloseClipboard                = user32.NewProc("CloseClipboard")
 	pIsClipboardFormatAvailable    = user32.NewProc("IsClipboardFormatAvailable")
 	pGetClipboardData              = user32.NewProc("GetClipboardData")
+	pRegisterClipboardFormatW      = user32.NewProc("RegisterClipboardFormatW")
 
 	pGetModuleHandleW = kernel32.NewProc("GetModuleHandleW")
 	pCreateMutexW     = kernel32.NewProc("CreateMutexW")
 	pGetLastError     = kernel32.NewProc("GetLastError")
+	pGlobalSize       = kernel32.NewProc("GlobalSize")
 
 	pGdiplusStartup              = gdiplus.NewProc("GdiplusStartup")
 	pGdiplusShutdown             = gdiplus.NewProc("GdiplusShutdown")
@@ -123,7 +136,24 @@ var (
 	counter      uint64
 	lastHash     string
 	lastEmitTime time.Time
+
+	// Registered clipboard format ids, filled in main().
+	cfEDPMarker, cfExcludeMonitor, cfViewerIgnore uintptr
 )
+
+func registerFormat(name string) uintptr {
+	p, _ := syscall.UTF16PtrFromString(name)
+	id, _, _ := pRegisterClipboardFormatW.Call(uintptr(unsafe.Pointer(p)))
+	return id
+}
+
+func formatAvailable(id uintptr) bool {
+	if id == 0 {
+		return false
+	}
+	r, _, _ := pIsClipboardFormatAvailable.Call(id)
+	return r != 0
+}
 
 func logf(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "[%s] %s\n", time.Now().Format(time.RFC3339), fmt.Sprintf(format, args...))
@@ -150,6 +180,10 @@ func main() {
 			os.Exit(0)
 		}
 	}
+
+	cfEDPMarker = registerFormat("EnterpriseDataProtectionId")
+	cfExcludeMonitor = registerFormat("ExcludeClipboardContentFromMonitorProcessing")
+	cfViewerIgnore = registerFormat("Clipboard Viewer Ignore")
 
 	if err := os.MkdirAll(winOutDir, 0o755); err != nil {
 		die("mkdir %q: %v", winOutDir, err)
@@ -234,7 +268,15 @@ func wndProc(hwnd, message, wparam, lparam uintptr) uintptr {
 func handleClipboardUpdate(hwnd uintptr) {
 	logf("event: WM_CLIPBOARDUPDATE")
 
+	if formatAvailable(cfExcludeMonitor) || formatAvailable(cfViewerIgnore) {
+		logf("  skip: copy asks clipboard monitors to ignore it")
+		return
+	}
 	if r, _, _ := pIsClipboardFormatAvailable.Call(cfBitmap); r == 0 {
+		if formatAvailable(cfUnicodeText) && formatAvailable(cfEDPMarker) {
+			handleMarkedText(hwnd)
+			return
+		}
 		logf("  skip: no CF_BITMAP on clipboard")
 		return
 	}
@@ -305,6 +347,38 @@ func handleClipboardUpdate(hwnd uintptr) {
 		os.Exit(0)
 	}
 	logf("  emit: %s (%d bytes, hash %s)", linuxPath, len(data), h[:8])
+}
+
+// handleMarkedText asks the WSL side to re-copy text whose
+// EnterpriseDataProtectionId marker is empty. Only handle sizes are touched.
+func handleMarkedText(hwnd uintptr) {
+	if r, _, _ := pOpenClipboard.Call(hwnd); r == 0 {
+		logf("  skip: OpenClipboard failed (marked text)")
+		return
+	}
+	defer pCloseClipboard.Call()
+
+	if h, _, _ := pGetClipboardData.Call(cfEDPMarker); h != 0 {
+		logf("  skip: text carries an enterprise data-protection label")
+		return
+	}
+	h, _, _ := pGetClipboardData.Call(cfUnicodeText)
+	if h == 0 {
+		logf("  skip: GetClipboardData(CF_UNICODETEXT) returned NULL")
+		return
+	}
+	size, _, _ := pGlobalSize.Call(h)
+	if size < 2 {
+		logf("  skip: empty text block")
+		return
+	}
+	// The block is NUL-terminated UTF-16 and may be padded; this is an upper
+	// bound the WSL side compares against, never the text itself.
+	units := size/2 - 1
+	if _, err := fmt.Printf("REOWN-TEXT %d\n", units); err != nil {
+		os.Exit(0)
+	}
+	logf("  emit: re-own marked text (block %d UTF-16 units)", units)
 }
 
 func die(format string, args ...interface{}) {
