@@ -13,6 +13,9 @@
 #   wsl-clip-bridge --doctor     check process counts; restart if unhealthy
 #   wsl-clip-bridge --watch      run --doctor's check every 30s (one instance)
 #   wsl-clip-bridge --ensure     start the watchdog detached if not running
+#   wsl-clip-bridge --restart-after-exit
+#                                restart the listener once the calling wsl.exe
+#                                has exited (for Windows launchers)
 #   wsl-clip-bridge --help
 
 set -euo pipefail
@@ -22,6 +25,7 @@ LISTENER_EXE="${WSL_CLIP_BRIDGE_EXE:-$HOME/.local/share/wsl-clip-bridge/clip-lis
 LOG_FILE="${WSL_CLIP_LOG:-$HOME/.cache/wsl-clip-bridge/bridge.log}"
 WATCH_LOCK="$LINUX_OUT/watch.lock"
 WATCH_INTERVAL="${WSL_CLIP_WATCH_INTERVAL:-30}"
+RESTART_MARGIN="${WSL_CLIP_RESTART_MARGIN:-1}"
 
 # Shells spawned at Claude Desktop launch lack XDG_RUNTIME_DIR, so wl-copy
 # cannot reach the Wayland socket. Supply WSLg's defaults.
@@ -149,6 +153,27 @@ case "${1:-}" in
         else
             echo "watchdog already running"
         fi
+        exit 0
+        ;;
+    --restart-after-exit|restart-after-exit)
+        # A listener started while a wsl.exe is still running goes mute once
+        # that wsl.exe exits: it keeps saving PNGs, but its output never
+        # reaches this script, so nothing is wl-copied. So a Windows launcher
+        # must not start it directly. Detach, wait for the caller to exit,
+        # give the Windows-side wsl.exe a moment to close, then restart.
+        if [[ "${2:-}" != --detached ]]; then
+            setsid -f "$0" --restart-after-exit --detached "$PPID" >/dev/null 2>&1 </dev/null
+            exit 0
+        fi
+        caller="${3:?}"
+        # /proc, not kill -0: the caller may be a root-owned /init relay.
+        for _ in $(seq 600); do
+            [[ -d "/proc/$caller" ]] || break
+            sleep 0.1
+        done
+        sleep "$RESTART_MARGIN"
+        echo "[$(date -Is)] restarting listener after launcher exit (caller $caller)" >> "$LOG_FILE"
+        repair
         exit 0
         ;;
     --help|-h|help)
